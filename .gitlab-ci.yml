@@ -1,0 +1,95 @@
+variables:
+  IMAGE_NAME: ${CI_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}
+  REPL_NUMBER: 2
+  NAMESPACE: microservices
+  NAME_APP: amp-production-cost
+
+stages:
+  - static-analyze
+  - build
+  - test
+  - push
+  - deploy
+
+
+static-analyze:
+  stage: static-analyze
+  image: python:3.7.12-slim-bullseye
+  tags:
+    - shared-docker01
+  only:
+
+    - /^dev-/
+  script:
+    - pip install flake8
+    - flake8 --exclude .git,__pycache__,docs/source/conf.py,old,build,dist,venv --ignore=E501,E402,W503 .
+
+
+build:
+  stage: build
+  services:
+    - docker:19-dind
+  before_script:
+    - echo "$CI_TOKEN" | docker login -u "$CI_USER" --password-stdin "$CI_REGISTRY"
+  only:
+    - main
+    - /^dev-/
+  tags:
+    - shared-docker01
+  script:
+    - echo ${CI_COMMIT_TAG}
+    - docker pull ${IMAGE_NAME}:latest || true
+    - docker build --cache-from ${IMAGE_NAME}:latest -f Dockerfile --tag ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} .
+
+
+test:
+  stage: test
+  services:
+    - docker:19-dind
+  tags:
+    - shared-docker01
+  before_script:
+    - echo "$CI_TOKEN" | docker login -u "$CI_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker stop ${CI_PROJECT_NAME} || true
+    - docker rm ${CI_PROJECT_NAME} ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} || true
+    - docker run -d --rm --memory=256m --env-file ${CI_CONFIG_SERVICE} --name ${CI_PROJECT_NAME} ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}
+    - docker exec -t  ${CI_PROJECT_NAME} bash -c "pytest tests.py"
+    - docker stop ${CI_PROJECT_NAME}
+    - docker rm ${CI_PROJECT_NAME} ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} || true
+  only:
+    - main
+    - /^dev-/
+
+push:
+  stage: push
+  only:
+    - main
+  tags:
+    - shared-docker01
+  before_script:
+    - echo "$CI_TOKEN" | docker login -u "$CI_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker build --cache-from ${IMAGE_NAME}:latest -f Dockerfile --tag ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} .
+    - docker tag ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} ${IMAGE_NAME}:latest
+    - docker push ${IMAGE_NAME}:latest
+    - docker push ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}
+
+
+deploy:
+  stage: deploy
+  image: dtzar/helm-kubectl:3.7
+  tags:
+    - shared-docker01
+  only:
+    - main
+  before_script:
+    - cat "$CI_CONFIG_SERVICE" > configMap.txt
+    - kubectl create configmap "cfm-$NAME_APP" --from-env-file=./configMap.txt --dry-run=client -o yaml > configmap.yaml
+    - sed -i 's#KUBE_TOKEN#'"$KUBE_TOKEN"'#g;' ./kubeconf && sed -i 's#KUBE_HOST#'"$KUBE_HOST"'#g;' ./kubeconf
+    - sed -i 's#_APP_NAME_#'"$NAME_APP"'#g;' ./service.yaml
+    - sed -i 's#_APP_NAME_#'"$NAME_APP"'#g;' ./deployment.yaml && sed -i 's#_IMAGE_NAME_#'"${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"'#g;' ./deployment.yaml && sed -i 's#_REPL_NUMBER_#'"$REPL_NUMBER"'#g;' ./deployment.yaml
+  script:
+    - kubectl --kubeconfig ./kubeconf apply -f service.yaml --namespace $NAMESPACE
+    - kubectl --kubeconfig ./kubeconf apply -f configmap.yaml --namespace $NAMESPACE
+    - kubectl --kubeconfig ./kubeconf apply -f deployment.yaml --namespace $NAMESPACE
